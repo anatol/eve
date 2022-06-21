@@ -9,10 +9,31 @@ import (
 	"fmt"
 	"time"
 
-	smart "github.com/anatol/smart.go"
+	"github.com/anatol/smart.go"
 	"github.com/jaypipes/ghw"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 )
+
+func ReadSMARTinfoForDisk(diskName string) (*types.DiskSmartInfo, error) {
+	dev, err := smart.Open(diskName)
+	if err != nil {
+		return nil, err
+	}
+	defer dev.Close()
+
+	switch sm := dev.(type) {
+	case *smart.SataDevice:
+		return GetInfoFromSATAdisk(diskName, sm)
+	case *smart.ScsiDevice:
+		return GetInfoFromSCSIDisk(diskName, sm)
+	case *smart.NVMeDevice:
+		return GetInfoFromNVMeDisk(diskName, sm)
+	default:
+		// When cannot open the disk, it means that it will not be
+		// possible to get SMART information from it. It's ok
+		return getInfoFromUnknownDisk(diskName, "unknown"), nil
+	}
+}
 
 // ReadSMARTinfoForDisks - сollects disks information via API,
 // returns types.DisksInformation
@@ -26,42 +47,8 @@ func ReadSMARTinfoForDisks() (*types.DisksInformation, error) {
 
 	for _, disk := range block.Disks {
 		diskName := fmt.Sprintf("/dev/%v", disk.Name)
-		var diskSmartInfo *types.DiskSmartInfo
 
-		dev, err := smart.Open(diskName)
-		if err != nil {
-			// When cannot open the disk, it means that it will not be
-			// possible to get SMART information from it. It's ok
-			diskSmartInfo = getInfoFromUnknownDisk(diskName, "unknown")
-			disksInfo.Disks = append(disksInfo.Disks, diskSmartInfo)
-			continue
-		}
-		diskType := dev.Type()
-		dev.Close()
-
-		if diskType == "sata" {
-			diskSmartInfo, err = GetInfoFromSATAdisk(diskName)
-			if err != nil {
-				disksInfo.Disks = append(disksInfo.Disks, diskSmartInfo)
-				continue
-			}
-		} else if diskType == "nvme" {
-			diskSmartInfo, err = GetInfoFromNVMeDisk(diskName)
-			if err != nil {
-				disksInfo.Disks = append(disksInfo.Disks, diskSmartInfo)
-				continue
-			}
-		} else if diskType == "scsi" {
-			diskSmartInfo, err = GetInfoFromSCSIDisk(diskName)
-			if err != nil {
-				disksInfo.Disks = append(disksInfo.Disks, diskSmartInfo)
-				continue
-			}
-		} else {
-			diskSmartInfo = getInfoFromUnknownDisk(diskName, diskType)
-			disksInfo.Disks = append(disksInfo.Disks, diskSmartInfo)
-		}
-
+		diskSmartInfo, _ := ReadSMARTinfoForDisk(diskName)
 		disksInfo.Disks = append(disksInfo.Disks, diskSmartInfo)
 	}
 	return disksInfo, nil
@@ -82,19 +69,11 @@ func getInfoFromUnknownDisk(diskName, diskType string) *types.DiskSmartInfo {
 
 // GetInfoFromSATAdisk - takes a disk name (/dev/sda or /dev/nvme0n1)
 // as input and returns information on it
-func GetInfoFromSATAdisk(diskName string) (*types.DiskSmartInfo, error) {
+func GetInfoFromSATAdisk(diskName string, dev *smart.SataDevice) (*types.DiskSmartInfo, error) {
 	diskInfo := new(types.DiskSmartInfo)
-	dev, err := smart.OpenSata(diskName)
-	if err != nil {
-		diskInfo.DiskName = diskName
-		diskInfo.Errors = fmt.Errorf("failed open SATA device with name: %s; error:%v", diskName, err)
-		diskInfo.CollectingStatus = types.SmartCollectingStatusError
-		diskInfo.TimeUpdate = uint64(time.Now().Unix())
-		return diskInfo, diskInfo.Errors
 
-	}
-	defer dev.Close()
-
+	diskInfo.DiskName = diskName
+	diskInfo.TimeUpdate = uint64(time.Now().Unix())
 	diskInfo.DiskName = diskName
 	diskInfo.DiskType = types.SmartDiskTypeSata
 
@@ -102,7 +81,6 @@ func GetInfoFromSATAdisk(diskName string) (*types.DiskSmartInfo, error) {
 	if err != nil {
 		diskInfo.Errors = fmt.Errorf("failed identify SATA device with name: %s; error:%v", diskName, err)
 		diskInfo.CollectingStatus = types.SmartCollectingStatusError
-		diskInfo.TimeUpdate = uint64(time.Now().Unix())
 		return diskInfo, diskInfo.Errors
 	}
 
@@ -110,54 +88,43 @@ func GetInfoFromSATAdisk(diskName string) (*types.DiskSmartInfo, error) {
 	if err != nil {
 		diskInfo.Errors = fmt.Errorf("failed read S.M.A.R.T. attr info from SATA device with name: %s; error:%v", diskName, err)
 		diskInfo.CollectingStatus = types.SmartCollectingStatusError
-		diskInfo.TimeUpdate = uint64(time.Now().Unix())
 		return diskInfo, diskInfo.Errors
 	}
 
-	for _, smart := range smartAttrList.Attrs {
+	for _, attr := range smartAttrList.Attrs {
 		smartAttr := new(types.DAttrTable)
-		smartAttr.ID = int(smart.Id)
-		smartAttr.Flags = int(smart.Flags)
-		smartAttr.RawValue = int(smart.VendorBytes[0])
-		smartAttr.Value = int(smart.Value)
-		smartAttr.Worst = int(smart.Worst)
+		smartAttr.ID = int(attr.Id)
+		smartAttr.Flags = int(attr.Flags)
+		smartAttr.RawValue = int(attr.VendorBytes[0])
+		smartAttr.Value = int(attr.ValueRaw)
+		smartAttr.Worst = int(attr.Worst)
 		diskInfo.SmartAttrs = append(diskInfo.SmartAttrs, smartAttr)
 	}
 
 	diskInfo.ModelNumber = devIdentify.ModelNumber()
 	diskInfo.SerialNumber = devIdentify.SerialNumber()
 	diskInfo.Wwn = devIdentify.WWN()
-	diskInfo.TimeUpdate = uint64(time.Now().Unix())
 	diskInfo.CollectingStatus = types.SmartCollectingStatusSuccess
 	return diskInfo, nil
 }
 
 // GetInfoFromNVMeDisk - takes a disk name (/dev/sda or /dev/nvme0n1)
 // as input and returns information on it
-func GetInfoFromNVMeDisk(diskName string) (*types.DiskSmartInfo, error) {
+func GetInfoFromNVMeDisk(diskName string, dev *smart.NVMeDevice) (*types.DiskSmartInfo, error) {
 	diskInfo := new(types.DiskSmartInfo)
 
-	dev, err := smart.OpenNVMe(diskName)
-	if err != nil {
-		diskInfo.DiskName = diskName
-		diskInfo.Errors = fmt.Errorf("failed open NVMe device with name: %s; error:%v", diskName, err)
-		diskInfo.CollectingStatus = types.SmartCollectingStatusError
-		diskInfo.TimeUpdate = uint64(time.Now().Unix())
-		return diskInfo, diskInfo.Errors
-	}
-	defer dev.Close()
+	diskInfo.DiskName = diskName
+	diskInfo.DiskType = types.SmartDiskTypeNvme
+	diskInfo.TimeUpdate = uint64(time.Now().Unix())
 
 	identController, _, err := dev.Identify()
 	if err != nil {
 		diskInfo.DiskName = diskName
 		diskInfo.Errors = fmt.Errorf("failed  NVMe identifye error:%v", err)
 		diskInfo.CollectingStatus = types.SmartCollectingStatusError
-		diskInfo.TimeUpdate = uint64(time.Now().Unix())
 		return diskInfo, diskInfo.Errors
 	}
 
-	diskInfo.DiskName = diskName
-	diskInfo.DiskType = types.SmartDiskTypeNvme
 	diskInfo.ModelNumber = identController.ModelNumber()
 	diskInfo.SerialNumber = identController.SerialNumber()
 
@@ -165,7 +132,6 @@ func GetInfoFromNVMeDisk(diskName string) (*types.DiskSmartInfo, error) {
 	if err != nil {
 		diskInfo.Errors = fmt.Errorf("failed read S.M.A.R.T. attr info from NVMe device with name: %s; error:%v", diskName, err)
 		diskInfo.CollectingStatus = types.SmartCollectingStatusError
-		diskInfo.TimeUpdate = uint64(time.Now().Unix())
 		return diskInfo, diskInfo.Errors
 	}
 
@@ -183,7 +149,6 @@ func GetInfoFromNVMeDisk(diskName string) (*types.DiskSmartInfo, error) {
 	smartPowerCycles.ID = types.SmartAttrIDPowerCycleCount
 	smartPowerCycles.RawValue = int(smartAttr.PowerCycles.Val[0])
 	diskInfo.SmartAttrs = append(diskInfo.SmartAttrs, smartPowerCycles)
-	diskInfo.TimeUpdate = uint64(time.Now().Unix())
 	diskInfo.CollectingStatus = types.SmartCollectingStatusSuccess
 
 	return diskInfo, nil
@@ -191,29 +156,19 @@ func GetInfoFromNVMeDisk(diskName string) (*types.DiskSmartInfo, error) {
 
 // GetInfoFromSCSIDisk - takes a disk name (/dev/sda or /dev/nvme0n1)
 // as input and returns information on it
-func GetInfoFromSCSIDisk(diskName string) (*types.DiskSmartInfo, error) {
+func GetInfoFromSCSIDisk(diskName string, dev *smart.ScsiDevice) (*types.DiskSmartInfo, error) {
 	diskInfo := new(types.DiskSmartInfo)
 
-	dev, err := smart.OpenScsi(diskName)
-	if err != nil {
-		diskInfo.DiskName = diskName
-		diskInfo.Errors = fmt.Errorf("failed open SCSI device with name: %s; error:%v", diskName, err)
-		diskInfo.CollectingStatus = types.SmartCollectingStatusError
-		diskInfo.TimeUpdate = uint64(time.Now().Unix())
-		return diskInfo, diskInfo.Errors
-	}
-	defer dev.Close()
-
 	diskInfo.DiskName = diskName
+	diskInfo.TimeUpdate = uint64(time.Now().Unix())
 	diskInfo.DiskType = types.SmartDiskTypeScsi
+	var err error
 	diskInfo.SerialNumber, err = dev.SerialNumber()
 	if err != nil {
 		diskInfo.Errors = fmt.Errorf("failed get SCSI device with name: %s; error:%v", diskName, err)
 		diskInfo.CollectingStatus = types.SmartCollectingStatusError
-		diskInfo.TimeUpdate = uint64(time.Now().Unix())
 		return diskInfo, diskInfo.Errors
 	}
-	diskInfo.TimeUpdate = uint64(time.Now().Unix())
 	diskInfo.CollectingStatus = types.SmartCollectingStatusSuccess
 
 	return diskInfo, nil
@@ -226,30 +181,22 @@ func GetSerialNumberForDisk(diskName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("disk with name: %s have unknown type", diskName)
 	}
-	diskType := dev.Type()
-	dev.Close()
+	defer dev.Close()
 
 	var diskSmartInfo *types.DiskSmartInfo
-
-	if diskType == "sata" {
-		diskSmartInfo, err = GetInfoFromSATAdisk(diskName)
-		if err != nil {
-			return "", err
-		}
-	} else if diskType == "nvme" {
-		diskSmartInfo, err = GetInfoFromNVMeDisk(diskName)
-		if err != nil {
-			return "", err
-		}
-	} else if diskType == "scsi" {
-		diskSmartInfo, err = GetInfoFromSCSIDisk(diskName)
-		if err != nil {
-			return "", err
-		}
-	} else {
-		return "",
-			fmt.Errorf("failed to get serial number for %s disk with type %s", diskName, diskType)
+	switch sm := dev.(type) {
+	case *smart.SataDevice:
+		diskSmartInfo, err = GetInfoFromSATAdisk(diskName, sm)
+	case *smart.ScsiDevice:
+		diskSmartInfo, err = GetInfoFromSCSIDisk(diskName, sm)
+	case *smart.NVMeDevice:
+		diskSmartInfo, err = GetInfoFromNVMeDisk(diskName, sm)
+	default:
+		return "", fmt.Errorf("failed to get serial number for %s disk with type %s", diskName, dev.Type())
 	}
 
+	if err != nil {
+		return "", err
+	}
 	return diskSmartInfo.SerialNumber, nil
 }
